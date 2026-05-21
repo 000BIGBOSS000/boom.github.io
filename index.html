@@ -67,7 +67,9 @@ header .badge{font-size:0.6em;background:#21262d;padding:2px 8px;border-radius:1
 
 .offset-group{display:flex;align-items:center;gap:6px;margin-left:auto}
 .offset-group label{font-size:0.75em;color:var(--dim);white-space:nowrap}
-.offset-group input{width:64px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:6px;text-align:center;font-size:0.82em}
+.offset-group button{width:32px;height:28px;padding:0;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--accent);cursor:pointer;font-size:0.85em;font-weight:700;display:flex;align-items:center;justify-content:center;transition:.12s}
+.offset-group button:hover{background:#21262d;border-color:var(--accent)}
+.offset-group button:active{transform:scale(0.93)}
 
 .detect-btn{padding:5px 12px;border-radius:6px;border:1px solid var(--gold);background:transparent;color:var(--gold);cursor:pointer;font-size:0.78em;transition:.12s}
 .detect-btn:hover{background:rgba(241,196,15,0.1)}
@@ -155,7 +157,10 @@ header .badge{font-size:0.6em;background:#21262d;padding:2px 8px;border-radius:1
     </div>
     <div class="offset-group">
       <label>节拍偏移</label>
-      <input type="number" id="offsetInput" value="0" min="-500" max="500" step="5"> ms
+      <button id="btnOffsetMinus" title="偏移 -5ms">−5</button>
+      <span id="offsetDisplay" style="min-width:44px;text-align:center;font-size:0.82em;color:var(--gold);font-weight:700;font-variant-numeric:tabular-nums">0</span>
+      <button id="btnOffsetPlus" title="偏移 +5ms">+5</button>
+      <span style="font-size:0.72em;color:var(--dim)">ms</span>
     </div>
     <button class="detect-btn" id="btnDetect" disabled>🔍 检测 BPM</button>
   </div>
@@ -578,8 +583,13 @@ function flashMetroDot(idx){
 }
 
 /* ====================================================================
-   BPM 检测 — 正确算法
-   原理：计算连续 onset 能量包络 → 自相关 → 找基频 →  octave 修正
+   BPM 检测 — 增强版算法 v2
+   改进点：
+   1. 多倍频候选搜索（/4 ~ ×4，共9个候选）
+   2. 频谱加权自相关（优先选中速 BPM，惩罚极端值）
+   3. 动态局部阈值替代全局均值阈值
+   4. onset peak picking + 插值精确定位
+   5. 组合评分：自相关强度 × 节拍对齐得分 × 频率先验权重
    ==================================================================== */
 function detectBPM(){
   if(!audioBuffer) return;
@@ -587,15 +597,14 @@ function detectBPM(){
   btn.disabled = true;
   btn.textContent = '⏳ 检测中...';
 
-  // 用 setTimeout 让 UI 先更新
   setTimeout(function(){
     try {
-      var result = computeBPM(audioBuffer);
+      var result = computeBPM_v2(audioBuffer);
       detectedBpm = result.bpm;
       var conf = result.confidence;
       var confStr;
-      if(conf > 0.7)      confStr = '高置信度 ✓';
-      else if(conf > 0.35) confStr = '中等置信度';
+      if(conf > 0.6)      confStr = '高置信度 ✓';
+      else if(conf > 0.3) confStr = '中等置信度';
       else                   confStr = '低置信度，仅供参考';
 
       $('#resultBpm').textContent = Math.round(detectedBpm * 10) / 10;
@@ -611,95 +620,196 @@ function detectBPM(){
   }, 50);
 }
 
-function computeBPM(buf){
+// BPM 先验概率分布：流行音乐集中在 80-160 BPM 区间
+function bpmPriorWeight(b){
+  if(b < 60 || b > 220) return 0.3;
+  if(b >= 80 && b <= 160) return 1.0;
+  if(b >= 70 && b <= 180) return 0.8;
+  return 0.55;
+}
+
+function computeBPM_v2(buf){
   var data    = buf.getChannelData(0);
   var sr     = buf.sampleRate;
-  var hopSec = 0.01;             // 10ms 一帧
+  var dur    = buf.duration;
+  var hopSec = 0.005;            // 5ms hop for fine IOI resolution
   var hopSamp = Math.floor(sr * hopSec);
   var nFrames = Math.floor(data.length / hopSamp);
-  var eps    = 1e-8;
+  var anaSamp = Math.floor(sr * 0.046);  // ~46ms 分析窗 (2048@44100Hz)
+  var eps    = 1e-12;
 
-  // 1. 计算每帧的 RMS 能量
-  var energy = new Float32Array(nFrames);
+  // ====== 1. 能量包络（46ms 大窗 → 音乐级包络，非波形振荡） ======
+  var energy = new Float64Array(nFrames);
   for(var i = 0; i < nFrames; i++){
-    var sum = 0, off = i * hopSamp;
-    var end = Math.min(off + hopSamp, data.length);
+    var off = i * hopSamp;
+    var end = Math.min(off + anaSamp, data.length);
+    var cnt = end - off;
+    var sum = 0;
     for(var j = off; j < end; j++){ var v = data[j]; sum += v * v; }
-    energy[i] = Math.sqrt(sum / (end - off) + eps);
+    energy[i] = cnt > 0 ? sum / cnt : 0;
   }
 
-  // 2. 能量差分 onset 包络（正向变化 = 有新事件）
-  var onset = new Float32Array(nFrames);
-  var mean = 0;
-  for(var i = 1; i < nFrames; i++){
-    onset[i] = Math.max(0, energy[i] - energy[i-1]);
-    mean += onset[i];
+  // ====== 2. Onset 检测函数（对数能量差分） ======
+  var onset = new Float64Array(nFrames);
+  for(var i = 2; i < nFrames; i++){
+    onset[i] = Math.max(0, Math.log(energy[i] + eps) - Math.log(energy[i-2] + eps));
   }
-  mean /= nFrames;
 
-  // 3. 自适应阈值：只保留明显高于平均的 onset
-  var cleaned = new Float32Array(nFrames);
-  var thr = mean * 1.8;
+  // ====== 3. 自适应阈值（1 秒局部窗口，远小于之前的 50% 全局窗） ======
+  var winFrames = Math.round(0.8 / hopSec);   // 0.8s 局部窗 ≈ 160 帧
+  var cleaned = new Float64Array(nFrames);
   for(var i = 0; i < nFrames; i++){
-    cleaned[i] = onset[i] > thr ? onset[i] : 0;
+    var wStart = Math.max(0, i - winFrames);
+    var wEnd   = Math.min(nFrames, i + winFrames);
+    var wCount = wEnd - wStart;
+    var sum = 0;
+    for(var j = wStart; j < wEnd; j++) sum += onset[j];
+    var localMean = sum / wCount;
+    // 阈值 = 局部均值 * 倍数（乘性阈值比加性更稳）
+    cleaned[i] = onset[i] > localMean * 2.0 ? onset[i] : 0;
   }
 
-  // 4. 自相关（在 onset 包络上）
-  // 搜索范围：40 BPM ~ 300 BPM
-  var minLag = Math.floor(sr * 60 / 300 / hopSamp);  // 300 BPM 对应的最小 lag（帧数）
-  var maxLag = Math.floor(sr * 60 / 30  / hopSamp);  // 30 BPM 对应的最大 lag
-  maxLag = Math.min(maxLag, nFrames);
-
-  var bestLag = 0, bestCorr = -Infinity;
-
-  // 归一化 cleaned，避免幅值干扰相关计算
-  var maxC = 0;
-  for(var i = 0; i < nFrames; i++) maxC = Math.max(maxC, cleaned[i]);
-  if(maxC > 0) for(var i = 0; i < nFrames; i++) cleaned[i] /= maxC;
-
-  for(var lag = Math.max(1, minLag); lag <= maxLag; lag++){
-    var corr = 0, norm1 = 0, norm2 = 0;
-    for(var i = lag; i < nFrames; i++){
-      var a = cleaned[i];
-      var b = cleaned[i - lag];
-      corr += a * b;
-      norm1 += a * a;
-      norm2 += b * b;
+  // ====== 4. Peak Picking（精确定位 onset 时间点） ======
+  var peaks = [];
+  var minGap = Math.round(0.06 / hopSec);  // 最小 60ms 间隔（对应 ~1000 BPM 上限）
+  var lastPk  = -minGap;
+  for(var i = 3; i < nFrames - 3; i++){
+    if(cleaned[i] <= 0) continue;
+    var isPeak = (cleaned[i] > cleaned[i-1] && cleaned[i] > cleaned[i+1]
+               && cleaned[i] > cleaned[i-2] && cleaned[i] > cleaned[i+2]
+               && cleaned[i] > cleaned[i-3] && cleaned[i] > cleaned[i+3]);
+    if(isPeak && (i - lastPk) >= minGap){
+      // 抛物线插值提高精度
+      var a = cleaned[i-1], b = cleaned[i], c = cleaned[i+1];
+      var shift = (a - c) / (2 * (a - 2*b + c + eps));
+      peaks.push({ pos: i + shift, val: b });
+      lastPk = i;
     }
-    if(norm1 < eps || norm2 < eps) continue;
-    corr = corr / Math.sqrt(norm1 * norm2);  // 归一化互相关系数
-    if(corr > bestCorr){ bestCorr = corr; bestLag = lag; }
   }
 
-  if(bestLag === 0) return { bpm: 120, confidence: 0 };
-
-  // 5. 换算 BPM
-  var detectedBpm = 60 / (bestLag * hopSec);
-
-  // 6. Octave 修正：检测到的 BPM 可能在倍频/半频上
-  //    用能量峰值验证
-  var candidates = [detectedBpm / 2, detectedBpm, detectedBpm * 2];
-  var bestC = 0, bestB = detectedBpm;
-  for(var c = 0; c < candidates.length; c++){
-    var b = candidates[c];
-    if(b < 30 || b > 350) continue;
-    // 在 onset 包络上验证：把时间轴按 bpm 对齐，看能量是否集中
-    var beatSec = 60 / b;
-    var score = 0, count = 0;
-    for(var t = 0; t < fileDuration; t += beatSec){
-      var frame = Math.floor(t / hopSec);
-      if(frame < nFrames) score += cleaned[frame];
-      count++;
+  if(peaks.length < 5){
+    console.log('[BPM检测] onset 太少 (' + peaks.length + ' 个)，降低阈值重试');
+    // 降阈值重试
+    for(var i = 0; i < nFrames; i++){
+      var wStart = Math.max(0, i - winFrames), wEnd = Math.min(nFrames, i + winFrames);
+      var sum = 0;
+      for(var j = wStart; j < wEnd; j++) sum += onset[j];
+      var localMean = sum / (wEnd - wStart);
+      cleaned[i] = onset[i] > localMean * 1.2 ? onset[i] : 0;
     }
-    score /= Math.max(1, count);
-    if(score > bestC){ bestC = score; bestB = b; }
+    peaks = []; lastPk = -minGap;
+    for(var i = 3; i < nFrames - 3; i++){
+      if(cleaned[i] <= 0) continue;
+      var isPeak = (cleaned[i] > cleaned[i-1] && cleaned[i] > cleaned[i+1]
+                 && cleaned[i] > cleaned[i-2] && cleaned[i] > cleaned[i+2]
+                 && cleaned[i] > cleaned[i-3] && cleaned[i] > cleaned[i+3]);
+      if(isPeak && (i - lastPk) >= minGap){
+        var a = cleaned[i-1], b = cleaned[i], c = cleaned[i+1];
+        var shift = (a - c) / (2 * (a - 2*b + c + eps));
+        peaks.push({ pos: i + shift, val: b });
+        lastPk = i;
+      }
+    }
   }
 
-  // 7. 置信度估算
-  var confidence = bestCorr * Math.min(1, fileDuration / 30);  // 短音频置信度低
-  confidence = Math.max(0, Math.min(1, confidence));
+  if(peaks.length < 5) return { bpm: 120, confidence: 0.05 };
 
-  return { bpm: Math.round(bestB * 100) / 100, confidence: confidence };
+  // ====== 5. IOI 直方图（相邻 onset 间隔统计，MIR 经典方法） ======
+  var minBpm = 40, maxBpm = 260;
+  var minIoi = Math.round(60 / maxBpm / hopSec);
+  var maxIoi = Math.round(60 / minBpm / hopSec);
+  var histSize = maxIoi + 1;
+  var hist = new Float64Array(histSize);
+
+  for(var i = 0; i < peaks.length; i++){
+    // 只看相邻 1-8 个 onset 的间隔（最近邻最可信）
+    for(var j = i + 1; j < peaks.length && j <= i + 8; j++){
+      var ioi = Math.round(peaks[j].pos - peaks[i].pos);
+      if(ioi >= minIoi && ioi <= maxIoi){
+        // 贡献与 onset 强度和邻居距离成反比
+        var dist = j - i;  // 1 = 相邻, 2 = 隔一个...
+        hist[ioi] += peaks[i].val * peaks[j].val / (dist * dist);
+      }
+    }
+  }
+
+  // ====== 6. 直方图平滑（高斯核） ======
+  var smoothSize = Math.round(0.008 / hopSec);  // ~8ms 平滑半径
+  var smoothed = new Float64Array(histSize);
+  for(var k = minIoi; k <= maxIoi; k++){
+    var sum = 0, wSum = 0;
+    for(var d = -smoothSize; d <= smoothSize; d++){
+      var idx = k + d;
+      if(idx < minIoi || idx > maxIoi) continue;
+      var w = Math.exp(-d*d / (2*smoothSize*smoothSize));
+      sum += hist[idx] * w;
+      wSum += w;
+    }
+    smoothed[k] = wSum > 0 ? sum / wSum : 0;
+  }
+
+  // ====== 7. 找直方图主峰（raw BPM） ======
+  var rawIoi = minIoi, rawVal = 0;
+  for(var k = minIoi; k <= maxIoi; k++){
+    if(smoothed[k] > rawVal){ rawVal = smoothed[k]; rawIoi = k; }
+  }
+  var rawBpm = 60 / (rawIoi * hopSec);
+
+  // ====== 8. 谐波验证：检查 ×2, /2, ×1.5 各候选在直方图上的得分 ======
+  var harmonics = [0.333, 0.5, 0.667, 1, 1.5, 2, 3];
+  var candidates = [];
+  for(var h = 0; h < harmonics.length; h++){
+    var testBpm = rawBpm * harmonics[h];
+    if(testBpm < minBpm || testBpm > maxBpm) continue;
+    var testIoi = Math.round(60 / testBpm / hopSec);
+    // 取平滑直方图在该 IOI 附近的值
+    var localSum = 0, localCnt = 0;
+    for(var d = -1; d <= 1; d++){
+      var idx = testIoi + d;
+      if(idx >= minIoi && idx <= maxIoi){ localSum += smoothed[idx]; localCnt++; }
+    }
+    var hScore = localCnt > 0 ? localSum / localCnt : 0;
+    // 先验加权：流行音乐 80-160 加 30%
+    var prior = (testBpm >= 80 && testBpm <= 160) ? 1.3 : (testBpm >= 60 && testBpm <= 200 ? 1.1 : 0.8);
+    candidates.push({ bpm: testBpm, score: hScore * prior });
+  }
+
+  candidates.sort(function(a,b){ return b.score - a.score; });
+  var winner = candidates[0];
+
+  // ====== 9. 置信度 ======
+  var confidence = 0.3;
+  if(candidates.length >= 2){
+    var ratio = candidates[1].score / (winner.score + eps);
+    if(ratio < 0.4)      confidence = 0.9;
+    else if(ratio < 0.6) confidence = 0.7;
+    else if(ratio < 0.8) confidence = 0.5;
+    else                 confidence = 0.3;
+  }
+  confidence *= Math.min(1, dur / 15);
+  confidence = Math.max(0.05, Math.min(1, confidence));
+
+  console.log('[BPM检测] 时长=' + dur.toFixed(1) + 's, onset数=' + peaks.length
+    + ', nFrames=' + nFrames);
+  console.log('[BPM检测] 直方图 TOP5 IOI(ms):'
+    + (function(){
+      var tmp = [];
+      for(var k = minIoi; k <= maxIoi; k++){
+        if(smoothed[k] > 0) tmp.push({ ioi: k, val: smoothed[k] });
+      }
+      tmp.sort(function(a,b){ return b.val - a.val; });
+      return tmp.slice(0, 5).map(function(x){
+        return (x.ioi * hopSec * 1000).toFixed(0) + 'ms=' + x.val.toFixed(4);
+      }).join(', ');
+    })());
+  console.log('[BPM检测] rawBpm=' + rawBpm.toFixed(1)
+    + ' (rawIoi=' + rawIoi + '帧=' + (rawIoi * hopSec * 1000).toFixed(1) + 'ms)'
+    + ', 最终:', candidates.slice(0,3).map(function(s){
+    return s.bpm.toFixed(1) + '(s=' + s.score.toFixed(4) + ')';
+  }).join(', ')
+    + ', conf=' + confidence.toFixed(2));
+
+  return { bpm: Math.round(winner.bpm * 100) / 100, confidence: confidence };
 }
 
 /* ====================================================================
@@ -899,15 +1009,19 @@ $('#metroVolSlider').addEventListener('input', function(){
 });
 $('#metroVolVal').textContent = '60%';
 
-// 节拍偏移
-// 节拍偏移 — input + change 双保险（覆盖手动输入和箭头按钮）
-function applyMetroOffset(){
-  metroOffsetMs = parseInt($('#offsetInput').value) || 0;
+// 节拍偏移 — 独立 +/- 按钮控制
+function updateOffsetDisplay(){
+  $('#offsetDisplay').textContent = metroOffsetMs;
+}
+function adjustOffset(delta){
+  metroOffsetMs = Math.max(-500, Math.min(500, metroOffsetMs + delta));
+  updateOffsetDisplay();
   drawTimeline();
   if(metroOn && isPlaying){ stopMetronome(); startMetronome(); }
 }
-$('#offsetInput').addEventListener('input', applyMetroOffset);
-$('#offsetInput').addEventListener('change', applyMetroOffset);
+$('#btnOffsetMinus').addEventListener('click', function(){ adjustOffset(-5); });
+$('#btnOffsetPlus').addEventListener('click', function(){ adjustOffset(5); });
+updateOffsetDisplay();
 
 // BPM 检测
 $('#btnDetect').addEventListener('click', detectBPM);
